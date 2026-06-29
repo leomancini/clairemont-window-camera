@@ -215,22 +215,23 @@ function App() {
             Loading…
           </div>
         )}
-
-        {currentDay && (
-          <div className="absolute bottom-4 left-4 inline-flex flex-col gap-0.5 rounded-xl border border-white/10 bg-black/65 px-4 py-3 backdrop-blur">
-            <span className="text-lg leading-tight font-semibold whitespace-nowrap text-white">
-              {formatDay(currentDay)}
-            </span>
-            <span className="text-sm whitespace-nowrap text-white/60">
-              {currentDay.y} · {formatHour(hour)}
-            </span>
-          </div>
-        )}
       </main>
 
       {/* Controls */}
       <footer className="border-t bg-card px-5 py-4">
         <div className="mx-auto flex max-w-5xl flex-col gap-4">
+          {/* Current date & time */}
+          {currentDay && (
+            <div className="flex items-baseline gap-2">
+              <span className="text-lg font-semibold tracking-tight">
+                {formatDay(currentDay)}, {currentDay.y}
+              </span>
+              <span className="text-muted-foreground text-sm">
+                · {formatHour(hour)}
+              </span>
+            </div>
+          )}
+
           {/* Day scrubber + transport */}
           <div className="flex items-center gap-4">
             <Button
