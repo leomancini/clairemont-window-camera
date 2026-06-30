@@ -1,15 +1,12 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState
-} from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Play,
   Pause,
   ChevronLeft,
   ChevronRight,
-  ImageOff
+  ImageOff,
+  CalendarDays,
+  Clock
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -54,15 +51,18 @@ const formatDay = ({ y, m, d }) => {
   return `${WEEKDAYS[date.getDay()]}, ${MONTHS[m - 1]} ${d}`;
 };
 
+const formatDayShort = ({ m, d }) => `${MONTHS[m - 1]} ${d}`;
+
 const formatHour = (hour) => {
   const period = hour < 12 ? "AM" : "PM";
   const h12 = hour % 12 === 0 ? 12 : hour % 12;
   return `${h12}:00 ${period}`;
 };
 
-// Build the list of valid days for a given hour, respecting the very first
-// image (2026-06-07 13:00) and not running past the most recent capture.
-const buildDays = (hour) => {
+// Every day from the first capture through today. Each day carries the range
+// of hours that actually have images: the first day starts at START_HOUR, and
+// today only goes up to the most recent hour.
+const buildAllDays = () => {
   const start = new Date(START_YEAR, START_MONTH - 1, START_DAY);
   const now = new Date();
 
@@ -75,26 +75,58 @@ const buildDays = (hour) => {
     const m = cursor.getMonth() + 1;
     const d = cursor.getDate();
 
-    const isFirstDay = y === START_YEAR && m === START_MONTH && d === START_DAY;
+    const isFirst = y === START_YEAR && m === START_MONTH && d === START_DAY;
     const isToday =
       y === now.getFullYear() &&
       m === now.getMonth() + 1 &&
       d === now.getDate();
 
-    // Skip the start day's hours before the first capture.
-    const beforeStart = isFirstDay && hour < START_HOUR;
-    // Skip today's hours that haven't happened yet.
-    const inFuture = isToday && hour > now.getHours();
-
-    if (!beforeStart && !inFuture) {
-      days.push({ y, m, d });
-    }
+    days.push({
+      y,
+      m,
+      d,
+      minHour: isFirst ? START_HOUR : 0,
+      maxHour: isToday ? now.getHours() : 23
+    });
 
     cursor.setDate(cursor.getDate() + 1);
   }
 
   return days;
 };
+
+const isValidFrame = (day, hour) =>
+  !!day && hour >= day.minHour && hour <= day.maxHour;
+
+// Hours that have an image for a given day.
+const hoursForDay = (day) => {
+  const out = [];
+  if (!day) return out;
+  for (let h = day.minHour; h <= day.maxHour; h++) out.push(h);
+  return out;
+};
+
+// Indices (into allDays) of the days that have an image at a given hour.
+const dayIdxsForHour = (allDays, hour) => {
+  const out = [];
+  allDays.forEach((day, i) => {
+    if (hour >= day.minHour && hour <= day.maxHour) out.push(i);
+  });
+  return out;
+};
+
+// Nearest day index to `from` whose image range includes `hour`.
+const nearestValidDay = (allDays, from, hour) => {
+  for (let off = 0; off < allDays.length; off++) {
+    const lo = from - off;
+    const hi = from + off;
+    if (lo >= 0 && isValidFrame(allDays[lo], hour)) return lo;
+    if (hi < allDays.length && isValidFrame(allDays[hi], hour)) return hi;
+  }
+  return from;
+};
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 const SPEEDS = [
   { label: "0.5×", ms: 1600 },
@@ -104,23 +136,37 @@ const SPEEDS = [
 ];
 
 function App() {
-  const [hour, setHour] = useState(START_HOUR);
-  const [dayIndex, setDayIndex] = useState(0);
+  const allDays = useMemo(buildAllDays, []);
+  const lastDayIdx = allDays.length - 1;
+
+  // "days": fix the hour, scrub across days. "hours": fix the day, scrub hours.
+  const [mode, setMode] = useState("days");
+
+  // Single source of truth for the displayed frame.
+  const [curDayIdx, setCurDayIdx] = useState(lastDayIdx);
+  const [curHour, setCurHour] = useState(START_HOUR);
+
   const [playing, setPlaying] = useState(false);
   const [speedIdx, setSpeedIdx] = useState(1);
   const [loaded, setLoaded] = useState(false);
   const [errored, setErrored] = useState(false);
 
-  const days = useMemo(() => buildDays(hour), [hour]);
+  const safeDayIdx = clamp(curDayIdx, 0, lastDayIdx);
+  const curDay = allDays[safeDayIdx];
+  const currentUrl = curDay ? imageUrl(curDay, curHour) : null;
 
-  // Keep the day index valid whenever the available days change.
-  useEffect(() => {
-    setDayIndex((i) => Math.min(i, Math.max(0, days.length - 1)));
-  }, [days.length]);
+  // The list the scrubber/playback moves through, depending on mode.
+  const activeDayIdxs = useMemo(
+    () => dayIdxsForHour(allDays, curHour),
+    [allDays, curHour]
+  );
+  const activeHours = useMemo(() => hoursForDay(curDay), [curDay]);
 
-  const safeIndex = Math.min(dayIndex, Math.max(0, days.length - 1));
-  const currentDay = days[safeIndex];
-  const currentUrl = currentDay ? imageUrl(currentDay, hour) : null;
+  const isDays = mode === "days";
+  const scrubLen = isDays ? activeDayIdxs.length : activeHours.length;
+  const scrubPos = isDays
+    ? Math.max(0, activeDayIdxs.indexOf(safeDayIdx))
+    : Math.max(0, activeHours.indexOf(curHour));
 
   // Reset load state when the displayed image changes.
   useEffect(() => {
@@ -128,63 +174,132 @@ function App() {
     setErrored(false);
   }, [currentUrl]);
 
-  // Preload every image for the selected hour so the slideshow is smooth.
+  // Preload the frames for the current axis so playback is smooth.
   useEffect(() => {
-    const imgs = days.map((day) => {
+    const urls = isDays
+      ? activeDayIdxs.map((i) => imageUrl(allDays[i], curHour))
+      : activeHours.map((h) => imageUrl(curDay, h));
+    const imgs = urls.map((src) => {
       const img = new Image();
-      img.src = imageUrl(day, hour);
+      img.src = src;
       return img;
     });
     return () => imgs.forEach((img) => (img.src = ""));
-  }, [days, hour]);
+  }, [isDays, activeDayIdxs, activeHours, allDays, curDay, curHour]);
 
-  // Slideshow timer.
-  useEffect(() => {
-    if (!playing || days.length < 2) return undefined;
-    const id = setInterval(() => {
-      setDayIndex((i) => (i + 1) % days.length);
-    }, SPEEDS[speedIdx].ms);
-    return () => clearInterval(id);
-  }, [playing, speedIdx, days.length]);
-
-  const togglePlay = useCallback(() => {
-    setPlaying((p) => !p);
-  }, []);
-
-  const stepDay = useCallback(
-    (delta) => {
-      setPlaying(false);
-      setDayIndex((i) => {
-        const next = i + delta;
-        if (next < 0) return 0;
-        if (next > days.length - 1) return days.length - 1;
-        return next;
-      });
+  const goToPos = useCallback(
+    (pos) => {
+      if (isDays) {
+        const i = activeDayIdxs[pos];
+        if (i != null) setCurDayIdx(i);
+      } else {
+        const h = activeHours[pos];
+        if (h != null) setCurHour(h);
+      }
     },
-    [days.length]
+    [isDays, activeDayIdxs, activeHours]
   );
 
-  // Keyboard shortcuts.
+  // Playback timer — advances one frame along the active axis, looping.
+  useEffect(() => {
+    if (!playing || scrubLen < 2) return undefined;
+    const id = setInterval(() => {
+      if (isDays) {
+        setCurDayIdx((prev) => {
+          const pos = activeDayIdxs.indexOf(clamp(prev, 0, lastDayIdx));
+          return activeDayIdxs[(pos + 1) % activeDayIdxs.length];
+        });
+      } else {
+        setCurHour((prev) => {
+          const pos = activeHours.indexOf(prev);
+          return activeHours[(pos + 1) % activeHours.length];
+        });
+      }
+    }, SPEEDS[speedIdx].ms);
+    return () => clearInterval(id);
+  }, [
+    playing,
+    speedIdx,
+    scrubLen,
+    isDays,
+    activeDayIdxs,
+    activeHours,
+    lastDayIdx
+  ]);
+
+  const togglePlay = useCallback(() => setPlaying((p) => !p), []);
+
+  const step = useCallback(
+    (delta) => {
+      setPlaying(false);
+      goToPos(clamp(scrubPos + delta, 0, scrubLen - 1));
+    },
+    [goToPos, scrubPos, scrubLen]
+  );
+
+  // Picker: choose the hour (days mode). Keep the current day valid for it.
+  const pickHour = useCallback(
+    (h) => {
+      setPlaying(false);
+      setCurHour(h);
+      setCurDayIdx((prev) => {
+        const i = clamp(prev, 0, lastDayIdx);
+        return isValidFrame(allDays[i], h) ? i : nearestValidDay(allDays, i, h);
+      });
+    },
+    [allDays, lastDayIdx]
+  );
+
+  // Picker: choose the day (hours mode). Keep the current hour valid for it.
+  const pickDay = useCallback(
+    (i) => {
+      setPlaying(false);
+      setCurDayIdx(i);
+      const day = allDays[i];
+      setCurHour((prev) => clamp(prev, day.minHour, day.maxHour));
+    },
+    [allDays]
+  );
+
+  const switchMode = useCallback((m) => {
+    if (!m) return;
+    setPlaying(false);
+    setMode(m);
+  }, []);
+
+  // Keyboard shortcuts. Left/right step the active axis; up/down nudge the
+  // other (picker) axis.
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === " ") {
         e.preventDefault();
         togglePlay();
       } else if (e.key === "ArrowRight") {
-        stepDay(1);
+        step(1);
       } else if (e.key === "ArrowLeft") {
-        stepDay(-1);
+        step(-1);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        setHour((h) => Math.min(23, h + 1));
+        if (isDays) pickHour(clamp(curHour + 1, 0, 23));
+        else pickDay(clamp(safeDayIdx + 1, 0, lastDayIdx));
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
-        setHour((h) => Math.max(0, h - 1));
+        if (isDays) pickHour(clamp(curHour - 1, 0, 23));
+        else pickDay(clamp(safeDayIdx - 1, 0, lastDayIdx));
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, stepDay]);
+  }, [
+    togglePlay,
+    step,
+    isDays,
+    pickHour,
+    pickDay,
+    curHour,
+    safeDayIdx,
+    lastDayIdx
+  ]);
 
   return (
     <div className="flex h-screen flex-col bg-background">
@@ -194,7 +309,7 @@ function App() {
           <img
             key={currentUrl}
             src={currentUrl}
-            alt={currentDay ? formatDay(currentDay) : ""}
+            alt={curDay ? formatDay(curDay) : ""}
             onLoad={() => setLoaded(true)}
             onError={() => setErrored(true)}
             draggable={false}
@@ -220,33 +335,52 @@ function App() {
       {/* Controls */}
       <footer className="border-t bg-card px-5 py-4">
         <div className="mx-auto flex max-w-5xl flex-col gap-4">
-          {/* Current date & time */}
-          {currentDay && (
-            <div className="flex items-baseline gap-2">
-              <span className="text-lg font-semibold tracking-tight">
-                {formatDay(currentDay)}, {currentDay.y}
-              </span>
-              <span className="text-muted-foreground text-sm">
-                · {formatHour(hour)}
-              </span>
-            </div>
-          )}
+          {/* Current date & time + mode toggle */}
+          <div className="flex items-center justify-between gap-4">
+            {curDay && (
+              <div className="flex items-baseline gap-2">
+                <span className="text-lg font-semibold tracking-tight">
+                  {formatDay(curDay)}, {curDay.y}
+                </span>
+                <span className="text-muted-foreground text-sm">
+                  · {formatHour(curHour)}
+                </span>
+              </div>
+            )}
 
-          {/* Day scrubber + transport */}
+            <ToggleGroup
+              type="single"
+              value={mode}
+              onValueChange={switchMode}
+              variant="outline"
+              size="sm"
+            >
+              <ToggleGroupItem value="days" className="gap-1.5 px-3 text-xs">
+                <CalendarDays className="size-3.5" />
+                Across days
+              </ToggleGroupItem>
+              <ToggleGroupItem value="hours" className="gap-1.5 px-3 text-xs">
+                <Clock className="size-3.5" />
+                Within a day
+              </ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+
+          {/* Transport + main scrubber (active axis) */}
           <div className="flex items-center gap-4">
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => stepDay(-1)}
-              disabled={safeIndex <= 0}
-              aria-label="Previous day"
+              onClick={() => step(-1)}
+              disabled={scrubPos <= 0}
+              aria-label={isDays ? "Previous day" : "Previous hour"}
             >
               <ChevronLeft className="size-5" />
             </Button>
             <Button
               size="icon"
               onClick={togglePlay}
-              disabled={days.length < 2}
+              disabled={scrubLen < 2}
               aria-label={playing ? "Pause" : "Play"}
               className="size-11 rounded-full"
             >
@@ -259,47 +393,59 @@ function App() {
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => stepDay(1)}
-              disabled={safeIndex >= days.length - 1}
-              aria-label="Next day"
+              onClick={() => step(1)}
+              disabled={scrubPos >= scrubLen - 1}
+              aria-label={isDays ? "Next day" : "Next hour"}
             >
               <ChevronRight className="size-5" />
             </Button>
 
             <Slider
-              value={[safeIndex]}
+              value={[scrubPos]}
               min={0}
-              max={Math.max(0, days.length - 1)}
+              max={Math.max(0, scrubLen - 1)}
               step={1}
               onValueChange={([v]) => {
                 setPlaying(false);
-                setDayIndex(v);
+                goToPos(v);
               }}
               className="flex-1"
             />
             <span className="text-muted-foreground w-20 text-right text-sm tabular-nums">
-              {days.length ? safeIndex + 1 : 0} / {days.length}
+              {scrubLen ? scrubPos + 1 : 0} / {scrubLen}
             </span>
           </div>
 
-          {/* Time-of-day + speed */}
+          {/* Picker (the fixed axis) + speed */}
           <div className="flex items-center gap-4">
-            <span className="text-muted-foreground w-20 text-xs font-medium tracking-wide uppercase">
-              Time
+            <span className="text-muted-foreground w-14 text-xs font-medium tracking-wide uppercase">
+              {isDays ? "Time" : "Day"}
             </span>
-            <Slider
-              value={[hour]}
-              min={0}
-              max={23}
-              step={1}
-              onValueChange={([v]) => {
-                setPlaying(false);
-                setHour(v);
-              }}
-              className="flex-1"
-            />
+            {isDays ? (
+              <Slider
+                value={[curHour]}
+                min={0}
+                max={23}
+                step={1}
+                onValueChange={([v]) => pickHour(v)}
+                className="flex-1"
+              />
+            ) : (
+              <Slider
+                value={[safeDayIdx]}
+                min={0}
+                max={lastDayIdx}
+                step={1}
+                onValueChange={([v]) => pickDay(v)}
+                className="flex-1"
+              />
+            )}
             <span className="w-20 text-sm font-semibold tabular-nums">
-              {formatHour(hour)}
+              {isDays
+                ? formatHour(curHour)
+                : curDay
+                  ? formatDayShort(curDay)
+                  : ""}
             </span>
 
             <ToggleGroup
