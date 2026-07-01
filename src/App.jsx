@@ -246,7 +246,14 @@ function App() {
       img.src = src;
       return img;
     });
-    return () => imgs.forEach((img) => (img.src = ""));
+    // Detach the handler before clearing src: assigning "" fires an error
+    // event, which would otherwise mark a perfectly good (or still-loading)
+    // frame as missing every time this effect re-runs.
+    return () =>
+      imgs.forEach((img) => {
+        img.onerror = null;
+        img.src = "";
+      });
   }, [isDays, activeDayIdxs, activeHours, allDays, curDay, curHour, markMissing]);
 
   const goToPos = useCallback(
