@@ -151,16 +151,39 @@ function App() {
   const [loaded, setLoaded] = useState(false);
   const [errored, setErrored] = useState(false);
 
+  // Frames (by URL) that we've learned have no image. Individual hourly
+  // captures can be missing inside a day's nominal min/max range, so we probe
+  // them via preloading and exclude the misses from scrubbing/playback rather
+  // than dwelling on the "No image for this time" screen.
+  const [missing, setMissing] = useState(() => new Set());
+  const markMissing = useCallback((url) => {
+    if (!url) return;
+    setMissing((prev) => {
+      if (prev.has(url)) return prev;
+      const next = new Set(prev);
+      next.add(url);
+      return next;
+    });
+  }, []);
+
   const safeDayIdx = clamp(curDayIdx, 0, lastDayIdx);
   const curDay = allDays[safeDayIdx];
   const currentUrl = curDay ? imageUrl(curDay, curHour) : null;
 
-  // The list the scrubber/playback moves through, depending on mode.
+  // The list the scrubber/playback moves through, depending on mode. Days/hours
+  // whose image is known to be missing are dropped so we skip straight past
+  // gaps instead of showing a black frame.
   const activeDayIdxs = useMemo(
-    () => dayIdxsForHour(allDays, curHour),
-    [allDays, curHour]
+    () =>
+      dayIdxsForHour(allDays, curHour).filter(
+        (i) => !missing.has(imageUrl(allDays[i], curHour))
+      ),
+    [allDays, curHour, missing]
   );
-  const activeHours = useMemo(() => hoursForDay(curDay), [curDay]);
+  const activeHours = useMemo(
+    () => hoursForDay(curDay).filter((h) => !missing.has(imageUrl(curDay, h))),
+    [curDay, missing]
+  );
 
   const isDays = mode === "days";
   const scrubLen = isDays ? activeDayIdxs.length : activeHours.length;
@@ -174,6 +197,44 @@ function App() {
     setErrored(false);
   }, [currentUrl]);
 
+  // If the visible frame turns out to have no image, jump to the nearest frame
+  // that does (searching outward along the active axis) so we never linger on
+  // the "No image for this time" screen while scrubbing or playing.
+  useEffect(() => {
+    if (!errored) return;
+    if (isDays) {
+      const order = dayIdxsForHour(allDays, curHour);
+      const pos = order.indexOf(safeDayIdx);
+      for (let off = 1; off < order.length; off++) {
+        const fwd = order[pos + off];
+        if (fwd != null && !missing.has(imageUrl(allDays[fwd], curHour))) {
+          setCurDayIdx(fwd);
+          return;
+        }
+        const back = order[pos - off];
+        if (back != null && !missing.has(imageUrl(allDays[back], curHour))) {
+          setCurDayIdx(back);
+          return;
+        }
+      }
+    } else {
+      const order = hoursForDay(curDay);
+      const pos = order.indexOf(curHour);
+      for (let off = 1; off < order.length; off++) {
+        const fwd = order[pos + off];
+        if (fwd != null && !missing.has(imageUrl(curDay, fwd))) {
+          setCurHour(fwd);
+          return;
+        }
+        const back = order[pos - off];
+        if (back != null && !missing.has(imageUrl(curDay, back))) {
+          setCurHour(back);
+          return;
+        }
+      }
+    }
+  }, [errored, isDays, allDays, curDay, curHour, safeDayIdx, missing]);
+
   // Preload the frames for the current axis so playback is smooth.
   useEffect(() => {
     const urls = isDays
@@ -181,11 +242,12 @@ function App() {
       : activeHours.map((h) => imageUrl(curDay, h));
     const imgs = urls.map((src) => {
       const img = new Image();
+      img.onerror = () => markMissing(src);
       img.src = src;
       return img;
     });
     return () => imgs.forEach((img) => (img.src = ""));
-  }, [isDays, activeDayIdxs, activeHours, allDays, curDay, curHour]);
+  }, [isDays, activeDayIdxs, activeHours, allDays, curDay, curHour, markMissing]);
 
   const goToPos = useCallback(
     (pos) => {
@@ -311,7 +373,10 @@ function App() {
             src={currentUrl}
             alt={curDay ? formatDay(curDay) : ""}
             onLoad={() => setLoaded(true)}
-            onError={() => setErrored(true)}
+            onError={() => {
+              setErrored(true);
+              markMissing(currentUrl);
+            }}
             draggable={false}
             className={`max-h-full max-w-full object-contain transition-opacity duration-150 ${
               loaded && !errored ? "opacity-100" : "opacity-0"
